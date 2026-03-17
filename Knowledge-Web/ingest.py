@@ -53,7 +53,7 @@ import vault_index as vi
 # ═══════════════════════════════════════════
 
 RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 529)
-MAX_RETRIES = 5
+MAX_LLM_RETRIES = 5
 BASE_DELAY = 1  # seconds
 
 
@@ -66,20 +66,24 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
-def _patch_llm_with_retry(processor: LLMProcessor) -> None:
+def _patch_llm_with_retry(processor: LLMProcessor, db: QueueDB | None = None) -> None:
     """
     Monkey-patch the LLMProcessor._call_llm method to wrap it
     with exponential backoff retry logic for 429/500/529 errors.
+    Optionally tracks Anthropic API calls in the quota DB.
     """
     original_call = processor._call_llm
 
     def call_with_retry(prompt: str) -> str:
         last_exc = None
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(MAX_LLM_RETRIES + 1):
             try:
-                return original_call(prompt)
+                result = original_call(prompt)
+                if db:
+                    db.add_anthropic_call()
+                return result
             except Exception as e:
-                if not _is_retryable(e) or attempt == MAX_RETRIES:
+                if not _is_retryable(e) or attempt == MAX_LLM_RETRIES:
                     raise
                 last_exc = e
                 delay = BASE_DELAY * (2 ** attempt)  # 1, 2, 4, 8, 16
@@ -87,11 +91,89 @@ def _patch_llm_with_retry(processor: LLMProcessor) -> None:
                 if isinstance(e, anthropic.APIStatusError):
                     status = f" (HTTP {e.status_code})"
                 print(f"    Retryable error{status}: {e}")
-                print(f"    Retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})...")
+                print(f"    Retrying in {delay}s (attempt {attempt + 1}/{MAX_LLM_RETRIES})...")
                 time.sleep(delay)
         raise last_exc  # unreachable, but satisfies type checker
 
     processor._call_llm = call_with_retry
+
+
+# ═══════════════════════════════════════════
+#  YouTube API Quota Tracker
+# ═══════════════════════════════════════════
+
+# Per YouTube Data API v3 docs — cost in quota units per operation
+QUOTA_COSTS = {
+    "videos.list": 1,
+    "channels.list": 1,
+    "playlistItems.list": 1,
+    "search.list": 100,
+}
+
+
+class QuotaGuard:
+    """
+    Tracks YouTube API quota usage and blocks requests when budget is exhausted.
+    Constitution budget: 10,000 units/day.
+    """
+
+    def __init__(self, db: QueueDB, daily_limit: int = 10000, reserve: int = 200):
+        self.db = db
+        self.daily_limit = daily_limit
+        self.reserve = reserve  # units reserved for Watch system
+
+    @property
+    def available(self) -> int:
+        """Units available for Ingest (total minus reserve minus used)."""
+        used = self.db.get_youtube_quota_today()
+        return max(0, self.daily_limit - self.reserve - used)
+
+    @property
+    def used(self) -> int:
+        return self.db.get_youtube_quota_today()
+
+    def check(self, units_needed: int, operation: str = "") -> bool:
+        """Check if we have enough quota. Returns True if OK."""
+        if units_needed > self.available:
+            op_str = f" for {operation}" if operation else ""
+            print(f"  QUOTA WARNING: Need {units_needed} units{op_str}, "
+                  f"only {self.available} available "
+                  f"({self.used}/{self.daily_limit - self.reserve} used today)")
+            return False
+        return True
+
+    def consume(self, units: int, operation: str = "") -> int:
+        """Record quota consumption. Returns new daily total."""
+        total = self.db.add_youtube_quota(units)
+        return total
+
+    def check_and_consume(self, operation: str, units: int | None = None) -> bool:
+        """Check quota and consume if available. Returns True if consumed."""
+        cost = units if units is not None else QUOTA_COSTS.get(operation, 1)
+        if not self.check(cost, operation):
+            return False
+        self.consume(cost, operation)
+        return True
+
+    def estimate_video_cost(self) -> int:
+        """Estimate quota cost for processing one video."""
+        # videos.list (1) + channels.list (1) = 2 units minimum
+        return 2
+
+    def estimate_playlist_cost(self, video_count: int) -> int:
+        """Estimate cost for resolving a playlist."""
+        pages = (video_count + 49) // 50  # 50 items per page
+        return pages  # playlistItems.list = 1 unit per page
+
+    def print_status(self) -> None:
+        """Print current quota status."""
+        stats = self.db.get_quota_stats()
+        avail = self.available
+        pct = (self.used / (self.daily_limit - self.reserve) * 100) if self.daily_limit > self.reserve else 0
+        print(f"  YouTube quota: {self.used}/{self.daily_limit - self.reserve} units "
+              f"({pct:.0f}% used, {avail} available)")
+        print(f"  Anthropic calls today: {stats.get('anthropic_calls', 0)}")
+        print(f"  Videos processed today: {stats.get('videos_processed', 0)}")
 
 
 # ═══════════════════════════════════════════
@@ -138,8 +220,16 @@ def load_vault_index_data(vault_path: str) -> dict:
 #  URL Resolution — Playlist & Channel
 # ═══════════════════════════════════════════
 
-def resolve_playlist_videos(extractor: YouTubeExtractor, playlist_id: str) -> list[str]:
-    """Fetch all video IDs from a YouTube playlist."""
+def resolve_playlist_videos(
+    extractor: YouTubeExtractor,
+    playlist_id: str,
+    quota: QuotaGuard | None = None,
+) -> list[str]:
+    """
+    Fetch all video IDs from a YouTube playlist.
+    Paginates through all results (50 per page).
+    Tracks quota: 1 unit per playlistItems.list call.
+    """
     if not extractor.youtube:
         raise RuntimeError("YouTube API key required for playlist resolution")
 
@@ -147,6 +237,10 @@ def resolve_playlist_videos(extractor: YouTubeExtractor, playlist_id: str) -> li
     next_page = None
 
     while True:
+        if quota and not quota.check(1, "playlistItems.list"):
+            print(f"  Stopping playlist resolution — quota exhausted (got {len(video_ids)} so far)")
+            break
+
         request = extractor.youtube.playlistItems().list(
             part="contentDetails",
             playlistId=playlist_id,
@@ -154,6 +248,9 @@ def resolve_playlist_videos(extractor: YouTubeExtractor, playlist_id: str) -> li
             pageToken=next_page,
         )
         response = request.execute()
+
+        if quota:
+            quota.consume(1, "playlistItems.list")
 
         for item in response.get("items", []):
             vid = item["contentDetails"].get("videoId")
@@ -167,10 +264,15 @@ def resolve_playlist_videos(extractor: YouTubeExtractor, playlist_id: str) -> li
     return video_ids
 
 
-def resolve_channel_uploads(extractor: YouTubeExtractor, channel_url: str) -> list[str]:
+def resolve_channel_uploads(
+    extractor: YouTubeExtractor,
+    channel_url: str,
+    quota: QuotaGuard | None = None,
+) -> list[str]:
     """
     Fetch all upload video IDs for a channel.
     Accepts a URL like https://youtube.com/@handle or a channel ID.
+    Tracks quota: 1 unit for channels.list + N units for playlistItems.list.
     """
     if not extractor.youtube:
         raise RuntimeError("YouTube API key required for channel resolution")
@@ -178,7 +280,12 @@ def resolve_channel_uploads(extractor: YouTubeExtractor, channel_url: str) -> li
     # Resolve handle to channel ID if needed
     handle = extract_channel_handle(channel_url)
     if handle:
+        if quota and not quota.check(1, "channels.list (handle resolve)"):
+            raise RuntimeError("YouTube quota exhausted — cannot resolve channel handle")
+
         channel_id = extractor.resolve_channel_handle(handle)
+        if quota:
+            quota.consume(1, "channels.list")
         if not channel_id:
             raise ValueError(f"Could not resolve channel handle: {handle}")
     else:
@@ -189,17 +296,23 @@ def resolve_channel_uploads(extractor: YouTubeExtractor, channel_url: str) -> li
     if channel_id.startswith("UC"):
         uploads_playlist = "UU" + channel_id[2:]
     else:
-        # Try fetching channel to get uploads playlist
+        if quota and not quota.check(1, "channels.list"):
+            raise RuntimeError("YouTube quota exhausted — cannot look up channel")
+
         response = extractor.youtube.channels().list(
             part="contentDetails",
             id=channel_id,
         ).execute()
+
+        if quota:
+            quota.consume(1, "channels.list")
+
         items = response.get("items", [])
         if not items:
             raise ValueError(f"Channel not found: {channel_id}")
         uploads_playlist = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
-    return resolve_playlist_videos(extractor, uploads_playlist)
+    return resolve_playlist_videos(extractor, uploads_playlist, quota=quota)
 
 
 # ═══════════════════════════════════════════
@@ -210,7 +323,7 @@ def queue_single_video(db: QueueDB, url: str, source: str = "manual") -> int:
     """Parse a single video URL and add to queue. Returns count added."""
     video_id = extract_video_id(url)
     if not video_id:
-        print(f"Error: Could not extract video ID from: {url}", file=sys.stderr)
+        print(f"  Error: Could not extract video ID from: {url}", file=sys.stderr)
         return 0
 
     if db.exists(video_id):
@@ -223,47 +336,67 @@ def queue_single_video(db: QueueDB, url: str, source: str = "manual") -> int:
     return 1
 
 
-def queue_playlist(db: QueueDB, extractor: YouTubeExtractor, url: str) -> int:
+def queue_video_ids(db: QueueDB, video_ids: list[str], source: str = "manual") -> int:
+    """Queue a list of video IDs. Returns count added."""
+    added = 0
+    for vid in video_ids:
+        video_url = f"https://youtube.com/watch?v={vid}"
+        if not db.exists(vid):
+            db.add_to_queue(video_id=vid, url=video_url, source=source)
+            added += 1
+    return added
+
+
+def queue_playlist(
+    db: QueueDB,
+    extractor: YouTubeExtractor,
+    url: str,
+    quota: QuotaGuard | None = None,
+) -> int:
     """Resolve a playlist and queue all videos."""
     playlist_id = extract_playlist_id(url)
     if not playlist_id:
-        print(f"Error: Could not extract playlist ID from: {url}", file=sys.stderr)
+        print(f"  Error: Could not extract playlist ID from: {url}", file=sys.stderr)
         return 0
 
-    print(f"Resolving playlist: {playlist_id}")
-    video_ids = resolve_playlist_videos(extractor, playlist_id)
-    print(f"  Found {len(video_ids)} videos")
+    print(f"  Resolving playlist: {playlist_id}")
+    video_ids = resolve_playlist_videos(extractor, playlist_id, quota=quota)
+    print(f"  Found {len(video_ids)} videos in playlist")
 
-    added = 0
-    for vid in video_ids:
-        video_url = f"https://youtube.com/watch?v={vid}"
-        if not db.exists(vid):
-            db.add_to_queue(video_id=vid, url=video_url, source="manual")
-            added += 1
-
-    print(f"  Queued {added} new videos ({len(video_ids) - added} already in queue)")
+    added = queue_video_ids(db, video_ids, source="manual")
+    skipped = len(video_ids) - added
+    print(f"  Queued {added} new videos" + (f" ({skipped} already in queue)" if skipped else ""))
     return added
 
 
-def queue_channel(db: QueueDB, extractor: YouTubeExtractor, url: str) -> int:
+def queue_channel(
+    db: QueueDB,
+    extractor: YouTubeExtractor,
+    url: str,
+    quota: QuotaGuard | None = None,
+) -> int:
     """Resolve a channel's uploads and queue all videos."""
-    print(f"Resolving channel uploads: {url}")
-    video_ids = resolve_channel_uploads(extractor, url)
+    print(f"  Resolving channel uploads: {url}")
+    video_ids = resolve_channel_uploads(extractor, url, quota=quota)
     print(f"  Found {len(video_ids)} uploads")
 
-    added = 0
-    for vid in video_ids:
-        video_url = f"https://youtube.com/watch?v={vid}"
-        if not db.exists(vid):
-            db.add_to_queue(video_id=vid, url=video_url, source="manual")
-            added += 1
-
-    print(f"  Queued {added} new videos ({len(video_ids) - added} already in queue)")
+    added = queue_video_ids(db, video_ids, source="manual")
+    skipped = len(video_ids) - added
+    print(f"  Queued {added} new videos" + (f" ({skipped} already in queue)" if skipped else ""))
     return added
 
 
-def queue_batch(db: QueueDB, filepath: str) -> int:
-    """Read URLs from a file (one per line) and queue them."""
+def queue_batch(
+    db: QueueDB,
+    filepath: str,
+    extractor: YouTubeExtractor | None = None,
+    quota: QuotaGuard | None = None,
+) -> int:
+    """
+    Read URLs from a file (one per line) and queue them.
+    Supports mixed URL types: video URLs, playlist URLs, channel URLs
+    (channel URLs require a @handle or /channel/ prefix to be detected).
+    """
     if not os.path.exists(filepath):
         print(f"Error: Batch file not found: {filepath}", file=sys.stderr)
         return 0
@@ -273,10 +406,26 @@ def queue_batch(db: QueueDB, filepath: str) -> int:
 
     print(f"Batch file: {len(urls)} URLs")
     added = 0
-    for url in urls:
-        added += queue_single_video(db, url, source="batch")
+    for i, url in enumerate(urls, 1):
+        print(f"[{i}/{len(urls)}] {url[:80]}")
 
-    print(f"  Queued {added} new videos")
+        # Detect URL type
+        if extract_playlist_id(url) and not extract_video_id(url):
+            # Pure playlist URL (no video ID in it)
+            if extractor and extractor.youtube:
+                added += queue_playlist(db, extractor, url, quota=quota)
+            else:
+                print(f"  Skipping playlist (no YouTube API key): {url}")
+        elif extract_channel_handle(url):
+            if extractor and extractor.youtube:
+                added += queue_channel(db, extractor, url, quota=quota)
+            else:
+                print(f"  Skipping channel (no YouTube API key): {url}")
+        else:
+            # Treat as single video URL
+            added += queue_single_video(db, url, source="batch")
+
+    print(f"\nBatch complete: {added} new videos queued from {len(urls)} URLs")
     return added
 
 
@@ -290,6 +439,8 @@ def process_single_video(
     processor: LLMProcessor,
     vault_path: str,
     db: QueueDB,
+    quota: QuotaGuard | None = None,
+    progress: str = "",
 ) -> bool:
     """
     Run the full pipeline for a single video:
@@ -299,9 +450,15 @@ def process_single_video(
 
     Returns True on success, False on failure.
     """
+    progress_str = f" {progress}" if progress else ""
     print(f"\n{'='*60}")
-    print(f"Processing: {video_id}")
+    print(f"Processing{progress_str}: {video_id}")
     print(f"{'='*60}")
+
+    # Pre-flight quota check: need ~2 units for extract (videos.list + channels.list)
+    if quota and not quota.check(quota.estimate_video_cost(), "video extraction"):
+        print("  Skipping — YouTube API quota exhausted for today")
+        return False
 
     db.mark_processing(video_id)
 
@@ -309,6 +466,10 @@ def process_single_video(
         # Step 1: Extract
         print("\n[Step 1/3] Extracting YouTube data...")
         extraction_data = extractor.extract(video_id)
+
+        # Track quota: videos.list (1) + channels.list (1) = 2 units
+        if quota:
+            quota.consume(2, "videos.list + channels.list")
 
         # Update queue with title/channel now that we have metadata
         title = extraction_data["metadata"]["title"]
@@ -332,7 +493,6 @@ def process_single_video(
         llm_results = processor.process(extraction_data, vault_index_data)
 
         note_generation = llm_results["note_generation"]
-        vn = note_generation.get("video_note", {})
         print(f"  Generated: video note + "
               f"{len(note_generation.get('people', []))} people + "
               f"{len(note_generation.get('topics', []))} new topics + "
@@ -341,11 +501,16 @@ def process_single_video(
         # Step 3: Write notes
         print("\n[Step 3/3] Writing notes to vault...")
         writer = NoteWriter(vault_path)
-        write_summary = writer.write_all(note_generation, extraction_data)
+        writer.write_all(note_generation, extraction_data)
 
-        # Mark complete
+        # Mark complete + track stats
         db.mark_complete(video_id)
+        db.add_video_processed()
         print(f"\n  Video {video_id} complete.")
+
+        if quota:
+            print(f"  Quota remaining: {quota.available} YouTube units")
+
         return True
 
     except Exception as e:
@@ -361,13 +526,16 @@ def process_queue(
     processor: LLMProcessor,
     vault_path: str,
     db: QueueDB,
+    quota: QuotaGuard | None = None,
     limit: int = 0,
+    inter_video_delay: float = 2.0,
 ) -> dict:
     """
     Process all pending items in the queue.
 
     Args:
         limit: Max items to process (0 = unlimited)
+        inter_video_delay: Seconds to wait between videos (rate limiting)
 
     Returns:
         Summary dict with success/failure counts.
@@ -378,27 +546,58 @@ def process_queue(
         print("No pending items in queue.")
         return {"processed": 0, "succeeded": 0, "failed": 0}
 
-    print(f"Processing {len(pending)} pending item(s)...\n")
+    total = len(pending)
+    print(f"Processing {total} pending item(s)...\n")
+
+    if quota:
+        est_cost = total * quota.estimate_video_cost()
+        if est_cost > quota.available:
+            max_affordable = quota.available // quota.estimate_video_cost()
+            print(f"  Warning: Estimated {est_cost} YouTube units needed, "
+                  f"only {quota.available} available.")
+            print(f"  Will process up to ~{max_affordable} videos before quota runs out.\n")
 
     succeeded = 0
     failed = 0
+    skipped_quota = 0
 
-    for entry in pending:
+    for i, entry in enumerate(pending):
         video_id = entry["id"]
-        ok = process_single_video(video_id, extractor, processor, vault_path, db)
+        progress = f"[{i + 1}/{total}]"
+
+        # Check quota before each video
+        if quota and not quota.check(quota.estimate_video_cost(), "next video"):
+            print(f"\n  Stopping — YouTube quota exhausted. "
+                  f"{total - i} videos remaining in queue.")
+            skipped_quota = total - i
+            break
+
+        ok = process_single_video(
+            video_id, extractor, processor, vault_path, db,
+            quota=quota, progress=progress,
+        )
         if ok:
             succeeded += 1
         else:
             failed += 1
 
+        # Inter-video delay (rate limiting) — skip after last video
+        if inter_video_delay > 0 and i < total - 1:
+            time.sleep(inter_video_delay)
+
     summary = {
         "processed": succeeded + failed,
         "succeeded": succeeded,
         "failed": failed,
+        "skipped_quota": skipped_quota,
     }
 
     print(f"\n{'='*60}")
-    print(f"Queue processing complete: {succeeded} succeeded, {failed} failed")
+    print(f"Queue processing complete: {succeeded} succeeded, {failed} failed", end="")
+    if skipped_quota:
+        print(f", {skipped_quota} skipped (quota)")
+    else:
+        print()
     print(f"{'='*60}")
 
     return summary
@@ -408,8 +607,8 @@ def process_queue(
 #  Status Display
 # ═══════════════════════════════════════════
 
-def print_status(db: QueueDB, vault_path: str) -> None:
-    """Print comprehensive status: queue + vault stats."""
+def print_status(db: QueueDB, vault_path: str, quota: QuotaGuard | None = None) -> None:
+    """Print comprehensive status: queue + quota + vault stats."""
     counts = db.get_status_counts()
     total = sum(counts.values())
 
@@ -425,6 +624,12 @@ def print_status(db: QueueDB, vault_path: str) -> None:
     print(f"  Total:      {total:4d}")
     print()
 
+    # Quota stats
+    if quota:
+        print("Quota (today):")
+        quota.print_status()
+        print()
+
     # Show recent failures
     failed = db.list_all(status="failed")
     if failed:
@@ -432,9 +637,10 @@ def print_status(db: QueueDB, vault_path: str) -> None:
         for entry in failed[:5]:
             title = (entry.get("title") or entry["id"])[:50]
             error = (entry.get("error") or "unknown")[:60]
+            retries = entry.get("retry_count", 0)
             print(f"  {title}")
             print(f"    Error: {error}")
-            print(f"    Retries: {entry.get('retry_count', 0)}")
+            print(f"    Retries: {retries}")
         print()
 
     # Vault stats
@@ -521,10 +727,20 @@ Examples:
     config = load_config()
     db = get_db(vault_path)
 
+    # Build quota guard
+    quota = QuotaGuard(
+        db=db,
+        daily_limit=config.get("youtube_daily_quota", 10000),
+        reserve=config.get("youtube_quota_reserve", 200),
+    )
+
+    max_retry_count = config.get("max_retry_count", 3)
+    inter_video_delay = config.get("inter_video_delay", 2)
+
     try:
         # ── Status only ──
         if args.status:
-            print_status(db, vault_path)
+            print_status(db, vault_path, quota=quota)
             if not args.url and not args.batch and not args.retry_failed:
                 return
 
@@ -547,23 +763,29 @@ Examples:
                 max_tokens=config.get("llm_max_tokens", 8000),
                 temperature=config.get("llm_temperature", 0.2),
             )
-            _patch_llm_with_retry(processor)
+            _patch_llm_with_retry(processor, db=db)
 
         # ── Queue population ──
         queued = 0
 
         if args.retry_failed:
-            failed = db.get_failed(max_retries=10)
+            failed = db.get_failed(max_retries=max_retry_count)
             if not failed:
-                print("No failed items to retry.")
+                print("No failed items eligible for retry "
+                      f"(max_retry_count={max_retry_count}).")
             else:
-                print(f"Resetting {len(failed)} failed item(s) to pending...")
+                print(f"Resetting {len(failed)} failed item(s) to pending "
+                      f"(retry_count < {max_retry_count})...")
                 for entry in failed:
                     db.reset_for_retry(entry["id"])
                     queued += 1
 
         if args.batch:
-            queued += queue_batch(db, args.batch)
+            queued += queue_batch(
+                db, args.batch,
+                extractor=extractor if yt_api_key else None,
+                quota=quota,
+            )
 
         elif args.url:
             # Determine URL type
@@ -571,13 +793,23 @@ Examples:
                 if not yt_api_key:
                     print("Error: YouTube API key required for --channel. Set in config.yaml", file=sys.stderr)
                     sys.exit(1)
-                queued += queue_channel(db, extractor, args.url)
+                queued += queue_channel(db, extractor, args.url, quota=quota)
 
-            elif extract_playlist_id(args.url):
+            elif extract_playlist_id(args.url) and not extract_video_id(args.url):
+                # Pure playlist URL (no video ID component)
                 if not yt_api_key:
                     print("Error: YouTube API key required for playlist. Set in config.yaml", file=sys.stderr)
                     sys.exit(1)
-                queued += queue_playlist(db, extractor, args.url)
+                queued += queue_playlist(db, extractor, args.url, quota=quota)
+
+            elif extract_playlist_id(args.url) and extract_video_id(args.url):
+                # URL has both video and playlist — treat as playlist
+                if yt_api_key:
+                    queued += queue_playlist(db, extractor, args.url, quota=quota)
+                else:
+                    # Fallback: just queue the single video
+                    print("  Note: Playlist detected but no YouTube API key — queueing single video only")
+                    queued += queue_single_video(db, args.url)
 
             else:
                 queued += queue_single_video(db, args.url)
@@ -598,7 +830,12 @@ Examples:
             sys.exit(1)
 
         # Process everything pending
-        process_queue(extractor, processor, vault_path, db, limit=args.limit)
+        process_queue(
+            extractor, processor, vault_path, db,
+            quota=quota,
+            limit=args.limit,
+            inter_video_delay=inter_video_delay,
+        )
 
     finally:
         db.close()

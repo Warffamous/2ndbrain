@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS channels_watched (
 CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
 CREATE INDEX IF NOT EXISTS idx_queue_source ON queue(source);
 CREATE INDEX IF NOT EXISTS idx_queue_added_at ON queue(added_at);
+
+CREATE TABLE IF NOT EXISTS api_quota (
+    date TEXT PRIMARY KEY,                  -- YYYY-MM-DD
+    youtube_units INTEGER DEFAULT 0,        -- YouTube Data API units consumed
+    anthropic_calls INTEGER DEFAULT 0,      -- Anthropic API calls made
+    videos_processed INTEGER DEFAULT 0      -- Videos fully processed
+);
 """
 
 
@@ -239,6 +246,77 @@ class QueueDB:
             "SELECT * FROM channels_watched ORDER BY channel_name"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Quota Tracking ──
+
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _ensure_quota_row(self, conn, date: str) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO api_quota (date) VALUES (?)", (date,)
+        )
+
+    def add_youtube_quota(self, units: int) -> int:
+        """Add YouTube API quota units for today. Returns new total."""
+        conn = self._connect()
+        today = self._today()
+        self._ensure_quota_row(conn, today)
+        conn.execute(
+            "UPDATE api_quota SET youtube_units = youtube_units + ? WHERE date = ?",
+            (units, today),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT youtube_units FROM api_quota WHERE date = ?", (today,)
+        ).fetchone()
+        return row["youtube_units"] if row else units
+
+    def get_youtube_quota_today(self) -> int:
+        """Get YouTube API units consumed today."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT youtube_units FROM api_quota WHERE date = ?",
+            (self._today(),),
+        ).fetchone()
+        return row["youtube_units"] if row else 0
+
+    def add_anthropic_call(self) -> None:
+        """Increment Anthropic API call count for today."""
+        conn = self._connect()
+        today = self._today()
+        self._ensure_quota_row(conn, today)
+        conn.execute(
+            "UPDATE api_quota SET anthropic_calls = anthropic_calls + 1 WHERE date = ?",
+            (today,),
+        )
+        conn.commit()
+
+    def add_video_processed(self) -> None:
+        """Increment videos processed count for today."""
+        conn = self._connect()
+        today = self._today()
+        self._ensure_quota_row(conn, today)
+        conn.execute(
+            "UPDATE api_quota SET videos_processed = videos_processed + 1 WHERE date = ?",
+            (today,),
+        )
+        conn.commit()
+
+    def get_quota_stats(self) -> dict:
+        """Get quota stats for today."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM api_quota WHERE date = ?", (self._today(),)
+        ).fetchone()
+        if row:
+            return dict(row)
+        return {
+            "date": self._today(),
+            "youtube_units": 0,
+            "anthropic_calls": 0,
+            "videos_processed": 0,
+        }
 
     def update_channel_check(
         self, channel_id: str, last_video_id: str | None = None

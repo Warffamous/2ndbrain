@@ -21,6 +21,14 @@ transcript_source: "youtube_first"  # youtube_first | whisper_only
 whisper_model: "medium"             # tiny | base | small | medium | large
 whisper_device: "cpu"               # cpu | cuda
 
+# Rate Limiting & Quotas
+youtube_daily_quota: 10000     # YouTube Data API v3: 10,000 units/day
+youtube_quota_reserve: 200     # Units reserved for Watch system
+inter_video_delay: 2           # Seconds to wait between processing videos
+
+# Retry Settings
+max_retry_count: 3             # Max times to retry a failed video
+
 # Enrichment
 scholarly_search: true
 scholarly_provider: "openalex"      # openalex (free) | semantic_scholar
