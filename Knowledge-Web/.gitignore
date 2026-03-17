@@ -1,0 +1,18 @@
+# Database
+_system/queue.db
+_system/queue.db-wal
+_system/queue.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit API keys
+_system/config.yaml

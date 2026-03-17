@@ -1,0 +1,45 @@
+# Knowledge-Web Configuration
+# ============================
+
+# API Keys
+youtube_api_key: ""
+anthropic_api_key: ""
+brave_search_key: ""
+
+# Paths
+vault_path: "./Knowledge-Web"
+queue_db: "_system/queue.db"
+vault_index: "_system/vault-index.json"
+
+# LLM Settings
+llm_model: "claude-sonnet-4-20250514"
+llm_max_tokens: 8000
+llm_temperature: 0.2
+
+# Transcript Settings
+transcript_source: "youtube_first"  # youtube_first | whisper_only
+whisper_model: "medium"             # tiny | base | small | medium | large
+whisper_device: "cpu"               # cpu | cuda
+
+# Enrichment
+scholarly_search: true
+scholarly_provider: "openalex"      # openalex (free) | semantic_scholar
+web_search: true
+web_search_provider: "brave"        # brave | serp
+
+# Watch Settings
+watch:
+  enabled: true
+  check_interval_hours: 6
+  channels: []  # Managed via watch.py --subscribe
+
+# Discover Settings
+discover:
+  enabled: true
+  schedule: "daily"
+  auto_ingest_youtube: true
+  auto_ingest_youtube_min_views: 10000
+  auto_add_articles: false
+  auto_add_papers: false
+  topics_per_run: 20
+  results_per_topic: 5
