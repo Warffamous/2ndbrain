@@ -254,6 +254,214 @@ class BraveSearchClient:
         return results
 
 
+class Enricher:
+    """Orchestrates OpenAlex, Crossref, and Brave clients to enrich LLM output."""
+
+    def __init__(self, config: dict | None = None):
+        cfg = config or load_config()
+        self.scholarly_enabled = cfg.get("scholarly_search", True)
+        self.web_enabled = cfg.get("web_search", True)
+
+        # Initialise clients lazily — only if their feature is enabled
+        self.openalex = OpenAlexClient() if self.scholarly_enabled else None
+        self.crossref = CrossrefClient() if self.scholarly_enabled else None
+        self.brave = None
+        if self.web_enabled:
+            try:
+                self.brave = BraveSearchClient()
+            except ValueError:
+                print("  [Enricher] Brave API key not configured — web search disabled")
+
+    # ── Public API ──
+
+    def enrich(self, llm_results: dict) -> dict:
+        """Enrich LLM output with scholarly refs and author/person metadata.
+
+        Args:
+            llm_results: dict from LLMProcessor.process() with keys
+                description_mining, transcript_processing, note_generation.
+
+        Returns:
+            The same dict, mutated in place, with enrichment fields populated:
+            - note_generation.video_note.has_scholarly_refs (bool)
+            - note_generation.video_note.scholarly_refs_markdown (str)
+            - Each person in note_generation.people gets:
+              h_index, publications_count, evidence_links
+        """
+        note_gen = llm_results.get("note_generation", {})
+        video_note = note_gen.get("video_note", {})
+        desc_mining = llm_results.get("description_mining", {})
+        transcript = llm_results.get("transcript_processing", {})
+
+        # 1. Scholarly references for the video note
+        if self.scholarly_enabled:
+            print("  [Enrich 1/2] Searching scholarly references...")
+            refs = self._gather_scholarly_refs(video_note, desc_mining, transcript)
+            video_note["has_scholarly_refs"] = len(refs) > 0
+            video_note["scholarly_refs_markdown"] = self._format_refs_markdown(refs)
+        else:
+            print("  [Enrich 1/2] Scholarly search disabled — skipping")
+
+        # 2. Person enrichment
+        people = note_gen.get("people", [])
+        if people:
+            print(f"  [Enrich 2/2] Enriching {len(people)} people...")
+            for person in people:
+                self._enrich_person(person)
+        else:
+            print("  [Enrich 2/2] No people to enrich")
+
+        return llm_results
+
+    # ── Scholarly References ──
+
+    def _build_search_query(self, video_note: dict, transcript: dict) -> str:
+        """Build a search query from the video's primary topics and title."""
+        topics = video_note.get("topics", [])
+        # Use up to 3 primary/secondary topics
+        primary = []
+        for t in transcript.get("topics", []):
+            if t.get("relevance") in ("primary", "secondary"):
+                primary.append(t["name"])
+            if len(primary) >= 3:
+                break
+        # Fallback to video_note topics if transcript topics not structured
+        if not primary and topics:
+            primary = topics[:3]
+        return " ".join(primary) if primary else video_note.get("cleaned_title", "")
+
+    def _gather_scholarly_refs(
+        self, video_note: dict, desc_mining: dict, transcript: dict
+    ) -> list[dict]:
+        """Search OpenAlex and Crossref for papers related to the video."""
+        query = self._build_search_query(video_note, transcript)
+        if not query:
+            return []
+
+        refs = []
+        seen_titles = set()
+
+        # OpenAlex
+        if self.openalex:
+            try:
+                works = self.openalex.search_works(query, max_results=3)
+                for w in works:
+                    key = (w.get("title") or "").lower().strip()
+                    if key and key not in seen_titles:
+                        seen_titles.add(key)
+                        refs.append({
+                            "title": w["title"],
+                            "authors": w["authors"],
+                            "doi": w["doi"],
+                            "year": w.get("year"),
+                            "source": "OpenAlex",
+                        })
+            except Exception as e:
+                print(f"    OpenAlex search failed: {e}")
+
+        # Crossref
+        if self.crossref:
+            try:
+                works = self.crossref.resolve_doi(query, max_results=3)
+                for w in works:
+                    key = (w.get("title") or "").lower().strip()
+                    if key and key not in seen_titles:
+                        seen_titles.add(key)
+                        refs.append({
+                            "title": w["title"],
+                            "authors": w["authors"],
+                            "doi": w.get("doi"),
+                            "year": w.get("publication_date", "").split("-")[0] or None,
+                            "source": "Crossref",
+                        })
+            except Exception as e:
+                print(f"    Crossref search failed: {e}")
+
+        # Also flag any papers from description mining book_references
+        for ref in desc_mining.get("book_references", []):
+            if ref.get("type") == "paper":
+                key = (ref.get("title") or "").lower().strip()
+                if key and key not in seen_titles:
+                    seen_titles.add(key)
+                    refs.append({
+                        "title": ref["title"],
+                        "authors": [ref.get("authors", "")],
+                        "doi": None,
+                        "year": None,
+                        "source": "description",
+                    })
+
+        return refs
+
+    @staticmethod
+    def _format_refs_markdown(refs: list[dict]) -> str:
+        """Format scholarly references as markdown for the video note."""
+        if not refs:
+            return "*No scholarly references found.*"
+
+        lines = []
+        for i, ref in enumerate(refs, 1):
+            title = ref.get("title") or "Untitled"
+            authors = ref.get("authors", [])
+            author_str = ", ".join(authors[:3])
+            if len(authors) > 3:
+                author_str += " et al."
+            year = ref.get("year")
+            year_str = f" ({year})" if year else ""
+            doi = ref.get("doi")
+            if doi:
+                doi_url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
+                lines.append(f"{i}. **{title}**{year_str} — {author_str} — [DOI]({doi_url})")
+            else:
+                lines.append(f"{i}. **{title}**{year_str} — {author_str}")
+        return "\n".join(lines)
+
+    # ── Person Enrichment ──
+
+    def _enrich_person(self, person: dict) -> None:
+        """Enrich a single person dict with h-index, publications, and evidence links."""
+        name = person.get("name", "")
+        if not name:
+            return
+
+        # OpenAlex author lookup
+        if self.openalex and self.scholarly_enabled:
+            try:
+                author_data = self.openalex.get_author(name)
+                if author_data:
+                    person["h_index"] = author_data.get("h_index", "unknown")
+                    person["publications_count"] = author_data.get("publication_count", "unknown")
+                    print(f"    {name}: h-index={person['h_index']}, "
+                          f"pubs={person['publications_count']}")
+                else:
+                    person.setdefault("h_index", "unknown")
+                    person.setdefault("publications_count", "unknown")
+                    print(f"    {name}: not found in OpenAlex")
+            except Exception as e:
+                person.setdefault("h_index", "unknown")
+                person.setdefault("publications_count", "unknown")
+                print(f"    {name}: OpenAlex lookup failed: {e}")
+        else:
+            person.setdefault("h_index", "unknown")
+            person.setdefault("publications_count", "unknown")
+
+        # Brave web search for evidence links
+        if self.brave and self.web_enabled:
+            role = person.get("role", "")
+            query = f"{name} {role}".strip() if role else name
+            try:
+                articles = self.brave.search_articles(query, max_results=3)
+                person["evidence_links"] = [
+                    f"[{a['title']}]({a['url']})" for a in articles
+                ]
+                print(f"    {name}: {len(articles)} evidence links found")
+            except Exception as e:
+                person.setdefault("evidence_links", [])
+                print(f"    {name}: Brave search failed: {e}")
+        else:
+            person.setdefault("evidence_links", [])
+
+
 if __name__ == "__main__":
     # --- OpenAlex tests ---
     client = OpenAlexClient()

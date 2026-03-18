@@ -43,6 +43,7 @@ from youtube_extractor import (
     extract_playlist_id,
     extract_video_id,
 )
+from enrichment import Enricher
 from llm_processor import LLMProcessor
 from note_writer import NoteWriter
 import vault_index as vi
@@ -439,6 +440,7 @@ def process_single_video(
     processor: LLMProcessor,
     vault_path: str,
     db: QueueDB,
+    enricher: Enricher | None = None,
     quota: QuotaGuard | None = None,
     progress: str = "",
 ) -> bool:
@@ -446,7 +448,8 @@ def process_single_video(
     Run the full pipeline for a single video:
       1. Extract (YouTube API + transcript)
       2. Process (3 LLM calls)
-      3. Write (vault notes)
+      3. Enrich (scholarly refs + person metadata)
+      4. Write (vault notes)
 
     Returns True on success, False on failure.
     """
@@ -464,7 +467,7 @@ def process_single_video(
 
     try:
         # Step 1: Extract
-        print("\n[Step 1/3] Extracting YouTube data...")
+        print("\n[Step 1/4] Extracting YouTube data...")
         extraction_data = extractor.extract(video_id)
 
         # Track quota: videos.list (1) + channels.list (1) = 2 units
@@ -488,7 +491,7 @@ def process_single_video(
               f"({len(extraction_data['transcript']['full_text']):,} chars)")
 
         # Step 2: LLM Processing
-        print("\n[Step 2/3] LLM processing...")
+        print("\n[Step 2/4] LLM processing...")
         vault_index_data = load_vault_index_data(vault_path)
         llm_results = processor.process(extraction_data, vault_index_data)
 
@@ -498,8 +501,16 @@ def process_single_video(
               f"{len(note_generation.get('topics', []))} new topics + "
               f"{len(note_generation.get('topic_updates', []))} topic updates")
 
-        # Step 3: Write notes
-        print("\n[Step 3/3] Writing notes to vault...")
+        # Step 3: Enrich with scholarly refs + person metadata
+        if enricher:
+            print("\n[Step 3/4] Enriching with external data...")
+            llm_results = enricher.enrich(llm_results)
+            note_generation = llm_results["note_generation"]
+        else:
+            print("\n[Step 3/4] Enrichment skipped (not configured)")
+
+        # Step 4: Write notes
+        print("\n[Step 4/4] Writing notes to vault...")
         writer = NoteWriter(vault_path)
         writer.write_all(note_generation, extraction_data)
 
@@ -526,6 +537,7 @@ def process_queue(
     processor: LLMProcessor,
     vault_path: str,
     db: QueueDB,
+    enricher: Enricher | None = None,
     quota: QuotaGuard | None = None,
     limit: int = 0,
     inter_video_delay: float = 2.0,
@@ -574,7 +586,7 @@ def process_queue(
 
         ok = process_single_video(
             video_id, extractor, processor, vault_path, db,
-            quota=quota, progress=progress,
+            enricher=enricher, quota=quota, progress=progress,
         )
         if ok:
             succeeded += 1
@@ -756,6 +768,7 @@ Examples:
         # ── Build LLM processor ──
         anthropic_key = config.get("anthropic_api_key", "")
         processor = None
+        enricher = None
         if anthropic_key and not args.dry_run:
             processor = LLMProcessor(
                 api_key=anthropic_key,
@@ -764,6 +777,9 @@ Examples:
                 temperature=config.get("llm_temperature", 0.2),
             )
             _patch_llm_with_retry(processor, db=db)
+
+            # Build enricher (uses OpenAlex, Crossref, Brave)
+            enricher = Enricher(config=config)
 
         # ── Queue population ──
         queued = 0
@@ -832,6 +848,7 @@ Examples:
         # Process everything pending
         process_queue(
             extractor, processor, vault_path, db,
+            enricher=enricher,
             quota=quota,
             limit=args.limit,
             inter_video_delay=inter_video_delay,
