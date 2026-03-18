@@ -1,7 +1,20 @@
 """API clients for enriching notes with academic paper and author data."""
 
+import os
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
+import yaml
+
+
+def load_config() -> dict:
+    """Load config.yaml from _system/ relative to this script."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "_system", "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return yaml.safe_load(f) or {}
+    return {}
 
 
 class OpenAlexClient:
@@ -167,6 +180,80 @@ class CrossrefClient:
         return results
 
 
+class BraveSearchClient:
+    """Client for querying the Brave Search API."""
+
+    BASE_URL = "https://api.search.brave.com/res/v1/web/search"
+
+    # Domains filtered out to favour high-signal sources
+    BLOCKED_DOMAINS = {
+        "reddit.com", "www.reddit.com",
+        "quora.com", "www.quora.com",
+        "pinterest.com", "www.pinterest.com",
+        "tiktok.com", "www.tiktok.com",
+        "facebook.com", "www.facebook.com",
+        "instagram.com", "www.instagram.com",
+        "twitter.com", "x.com",
+        "yahoo.com", "answers.yahoo.com",
+    }
+
+    def __init__(self, api_key=None):
+        config = load_config()
+        self.api_key = api_key or config.get("brave_search_key", "")
+        if not self.api_key:
+            raise ValueError(
+                "Brave API key required: pass api_key or set brave_search_key "
+                "in _system/config.yaml"
+            )
+        self.session = requests.Session()
+        self.session.headers["X-Subscription-Token"] = self.api_key
+        self.session.headers["Accept"] = "application/json"
+
+    def _domain_from_url(self, url):
+        """Extract the root domain from a URL."""
+        hostname = urlparse(url).hostname or ""
+        return hostname.lower()
+
+    def search_articles(self, query, max_results=3):
+        """Search the web for articles on a topic, filtering low-signal sites.
+
+        Args:
+            query: Search query string.
+            max_results: Number of high-quality results to return (default 3).
+
+        Returns:
+            List of dicts with keys: title, url, description, domain.
+        """
+        # Request extra results so we still hit max_results after filtering
+        fetch_count = max_results + len(self.BLOCKED_DOMAINS)
+        resp = self.session.get(
+            self.BASE_URL,
+            params={"q": query, "count": fetch_count},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        results = []
+        for item in data.get("web", {}).get("results", []):
+            url = item.get("url", "")
+            domain = self._domain_from_url(url)
+
+            if domain in self.BLOCKED_DOMAINS:
+                continue
+
+            results.append({
+                "title": item.get("title"),
+                "url": url,
+                "description": item.get("description"),
+                "domain": domain,
+            })
+
+            if len(results) >= max_results:
+                break
+
+        return results
+
+
 if __name__ == "__main__":
     # --- OpenAlex tests ---
     client = OpenAlexClient()
@@ -204,3 +291,19 @@ if __name__ == "__main__":
         print(f"  DOI:       {w['doi']}")
         print(f"  Publisher: {w['publisher']}")
         print(f"  Date:      {w['publication_date']}")
+
+    # --- Brave Search tests ---
+    try:
+        brave = BraveSearchClient()
+        print("\n\n=== Brave Search: 'large language model scaling laws' ===")
+        articles = brave.search_articles("large language model scaling laws",
+                                         max_results=3)
+        for i, a in enumerate(articles, 1):
+            print(f"\n--- Article {i} ---")
+            print(f"  Title:       {a['title']}")
+            print(f"  URL:         {a['url']}")
+            print(f"  Domain:      {a['domain']}")
+            desc_preview = (a['description'] or '')[:120]
+            print(f"  Description: {desc_preview}...")
+    except ValueError as e:
+        print(f"\n\n=== Brave Search: SKIPPED ({e}) ===")
