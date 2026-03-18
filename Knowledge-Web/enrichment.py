@@ -1,4 +1,4 @@
-"""OpenAlex API client for enriching notes with academic paper and author data."""
+"""API clients for enriching notes with academic paper and author data."""
 
 import requests
 from urllib.parse import quote
@@ -103,10 +103,75 @@ class OpenAlexClient:
         }
 
 
+class CrossrefClient:
+    """Client for querying the Crossref metadata API."""
+
+    BASE_URL = "https://api.crossref.org"
+
+    def __init__(self, email=None):
+        self.session = requests.Session()
+        # Crossref polite pool: pass email in User-Agent for better rate limits
+        ua = "2ndBrain/0.1 (https://github.com/2ndbrain)"
+        if email:
+            ua += f" (mailto:{email})"
+        self.session.headers["User-Agent"] = ua
+
+    def resolve_doi(self, query, max_results=3):
+        """Search Crossref for works matching a query string.
+
+        Args:
+            query: Search query (topic keyword, title fragment, etc.).
+            max_results: Maximum number of results to return (default 3).
+
+        Returns:
+            List of dicts with keys: title, authors, doi, publisher,
+            publication_date.
+        """
+        resp = self.session.get(
+            f"{self.BASE_URL}/works",
+            params={"query": query, "rows": max_results},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        results = []
+        for item in data.get("message", {}).get("items", []):
+            # Title is an array; take the first entry
+            titles = item.get("title", [])
+            title = titles[0] if titles else None
+
+            # Authors: each has 'given' and 'family' keys
+            authors = []
+            for a in item.get("author", []):
+                given = a.get("given", "")
+                family = a.get("family", "")
+                authors.append(f"{given} {family}".strip())
+
+            # Publication date from 'published' or 'issued' date-parts
+            pub_date = None
+            date_field = item.get("published") or item.get("issued")
+            if date_field:
+                parts = date_field.get("date-parts", [[]])
+                if parts and parts[0]:
+                    p = parts[0]
+                    pub_date = "-".join(str(x) for x in p)
+
+            results.append({
+                "title": title,
+                "authors": authors,
+                "doi": item.get("DOI"),
+                "publisher": item.get("publisher"),
+                "publication_date": pub_date,
+            })
+
+        return results
+
+
 if __name__ == "__main__":
+    # --- OpenAlex tests ---
     client = OpenAlexClient()
 
-    print("=== Search Works: 'transformer attention mechanism' ===")
+    print("=== OpenAlex: Search Works 'transformer attention mechanism' ===")
     papers = client.search_works("transformer attention mechanism", max_results=3)
     for i, p in enumerate(papers, 1):
         print(f"\n--- Paper {i} ---")
@@ -117,7 +182,7 @@ if __name__ == "__main__":
         abstract_preview = (p['abstract'] or '')[:120]
         print(f"  Abstract: {abstract_preview}...")
 
-    print("\n\n=== Get Author: 'Yoshua Bengio' ===")
+    print("\n\n=== OpenAlex: Get Author 'Yoshua Bengio' ===")
     author = client.get_author("Yoshua Bengio")
     if author:
         print(f"  H-index:        {author['h_index']}")
@@ -126,3 +191,16 @@ if __name__ == "__main__":
         print(f"  Google Scholar: {author['google_scholar_url']}")
     else:
         print("  No author found.")
+
+    # --- Crossref tests ---
+    cr = CrossrefClient()
+
+    print("\n\n=== Crossref: resolve_doi 'deep reinforcement learning' ===")
+    works = cr.resolve_doi("deep reinforcement learning", max_results=3)
+    for i, w in enumerate(works, 1):
+        print(f"\n--- Result {i} ---")
+        print(f"  Title:     {w['title']}")
+        print(f"  Authors:   {', '.join(w['authors'][:3])}")
+        print(f"  DOI:       {w['doi']}")
+        print(f"  Publisher: {w['publisher']}")
+        print(f"  Date:      {w['publication_date']}")
