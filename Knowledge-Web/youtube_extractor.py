@@ -40,9 +40,9 @@ def _get_youtube_service(api_key: str):
 
 
 def _get_transcript_api():
-    """Lazy-import youtube_transcript_api."""
+    """Lazy-import youtube_transcript_api (v1.x instance-based API)."""
     from youtube_transcript_api import YouTubeTranscriptApi
-    return YouTubeTranscriptApi
+    return YouTubeTranscriptApi()
 
 
 # ═══════════════════════════════════════════
@@ -330,20 +330,14 @@ class YouTubeExtractor:
         }
 
     def _fetch_youtube_transcript(self, video_id: str) -> list[dict]:
-        """Fetch transcript via youtube-transcript-api."""
-        YTApi = _get_transcript_api()
-        transcript_list = YTApi.list_transcripts(video_id)
+        """Fetch transcript via youtube-transcript-api (v1.x API)."""
+        ytt_api = _get_transcript_api()
 
-        # Prefer manually created English, then auto-generated English, then anything
-        try:
-            transcript = transcript_list.find_manually_created_transcript(["en"])
-        except Exception:
-            try:
-                transcript = transcript_list.find_generated_transcript(["en"])
-            except Exception:
-                transcript = next(iter(transcript_list))
-
-        return transcript.fetch()
+        # fetch() accepts language codes in priority order and returns a
+        # FetchedTranscript object. .to_raw_data() converts it back to the
+        # list-of-dicts format [{text, start, duration}, ...] used downstream.
+        transcript = ytt_api.fetch(video_id, languages=["en"])
+        return transcript.to_raw_data()
 
     @staticmethod
     def _format_timestamped(segments: list[dict]) -> str:
