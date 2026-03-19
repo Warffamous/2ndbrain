@@ -19,10 +19,12 @@ Standalone CLI:
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -39,10 +41,10 @@ def _get_youtube_service(api_key: str):
     return build("youtube", "v3", developerKey=api_key)
 
 
-def _get_transcript_api():
+def _get_transcript_api(proxy_config=None):
     """Lazy-import youtube_transcript_api (v1.x instance-based API)."""
     from youtube_transcript_api import YouTubeTranscriptApi
-    return YouTubeTranscriptApi()
+    return YouTubeTranscriptApi(proxy_config=proxy_config)
 
 
 # ═══════════════════════════════════════════
@@ -209,12 +211,22 @@ class YouTubeExtractor:
         transcript_source: str = "youtube_first",
         whisper_model: str = "medium",
         whisper_device: str = "cpu",
+        webshare_proxy_username: str = "",
+        webshare_proxy_password: str = "",
     ):
         self.api_key = api_key
         self.transcript_source = transcript_source
         self.whisper_model = whisper_model
         self.whisper_device = whisper_device
         self._youtube = None
+        self._proxy_config = None
+        if webshare_proxy_username and webshare_proxy_password:
+            from youtube_transcript_api.proxies import WebshareProxyConfig
+            self._proxy_config = WebshareProxyConfig(
+                proxy_username=webshare_proxy_username,
+                proxy_password=webshare_proxy_password,
+                filter_ip_locations=["nl", "de", "us"],
+            )
 
     @property
     def youtube(self):
@@ -331,7 +343,12 @@ class YouTubeExtractor:
 
     def _fetch_youtube_transcript(self, video_id: str) -> list[dict]:
         """Fetch transcript via youtube-transcript-api (v1.x API)."""
-        ytt_api = _get_transcript_api()
+        # Randomized delay (3–8s) before every transcript request to reduce
+        # the chance of rate-limiting, regardless of proxy use.
+        delay = random.uniform(3.0, 8.0)
+        time.sleep(delay)
+
+        ytt_api = _get_transcript_api(proxy_config=self._proxy_config)
 
         # fetch() accepts language codes in priority order and returns a
         # FetchedTranscript object. .to_raw_data() converts it back to the
@@ -496,6 +513,8 @@ def main():
         transcript_source=transcript_source,
         whisper_model=whisper_model,
         whisper_device=whisper_device,
+        webshare_proxy_username=config.get("webshare_proxy_username", ""),
+        webshare_proxy_password=config.get("webshare_proxy_password", ""),
     )
 
     result = {}

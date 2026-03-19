@@ -21,6 +21,12 @@ transcript_source: "youtube_first"  # youtube_first | whisper_only
 whisper_model: "medium"             # tiny | base | small | medium | large
 whisper_device: "cpu"               # cpu | cuda
 
+# Webshare Rotating Residential Proxy (optional, strongly recommended for playlist processing)
+# Sign up at webshare.io and purchase a "Residential" proxy plan (NOT "Proxy Server" or "Static Residential").
+# When configured, transcript requests route through rotating IPs to avoid YouTube rate-limiting.
+webshare_proxy_username: ""
+webshare_proxy_password: ""
+
 # Rate Limiting & Quotas
 youtube_daily_quota: 10000     # YouTube Data API v3: 10,000 units/day
 youtube_quota_reserve: 200     # Units reserved for Watch system
