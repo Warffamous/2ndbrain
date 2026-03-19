@@ -28,7 +28,7 @@ def load_config(vault_path: str) -> dict:
     if not os.path.exists(config_path):
         print(f"Error: Config file not found at {config_path}")
         sys.exit(1)
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -126,7 +126,7 @@ def load_existing_index(index_path: str) -> dict | None:
     if not os.path.exists(index_path):
         return None
     try:
-        with open(index_path, "r") as f:
+        with open(index_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return None
@@ -135,7 +135,7 @@ def load_existing_index(index_path: str) -> dict | None:
 def save_index(index: dict, index_path: str) -> None:
     """Save the vault index to disk."""
     os.makedirs(os.path.dirname(index_path), exist_ok=True)
-    with open(index_path, "w") as f:
+    with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2, ensure_ascii=False)
 
 
