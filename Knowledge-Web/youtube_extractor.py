@@ -227,6 +227,7 @@ class YouTubeExtractor:
                 proxy_password=webshare_proxy_password,
                 filter_ip_locations=["nl", "de", "us"],
             )
+            print("  Using Webshare proxy (rotating residential, locations: nl/de/us)")
 
     @property
     def youtube(self):

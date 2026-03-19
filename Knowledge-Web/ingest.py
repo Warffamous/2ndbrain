@@ -763,6 +763,8 @@ Examples:
             transcript_source=config.get("transcript_source", "youtube_first"),
             whisper_model=config.get("whisper_model", "medium"),
             whisper_device=config.get("whisper_device", "cpu"),
+            webshare_proxy_username=config.get("webshare_proxy_username", ""),
+            webshare_proxy_password=config.get("webshare_proxy_password", ""),
         )
 
         # ── Build LLM processor ──
